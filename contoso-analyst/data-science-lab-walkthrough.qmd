@@ -1,0 +1,245 @@
+---
+title: "Building an AI ML Engineer with TabPFN and ellmer"
+author: "frank hull"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Welcome
+
+This lab introduces **Tabular Foundation Models** in R using **tabpfn** and shows how to expose predictive models as tools using **ellmer**.
+
+## Learning objectives
+
+- Train a TabPFN classifier
+- Explore a realistic business dataset
+- Wrap predictions in reusable R functions
+- Register those functions as LLM tools
+- Build a simple AI analyst
+
+# Packages
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(gt)
+library(rsample)
+library(yardstick)
+library(ellmer)
+library(tabpfn)
+library(contoso)
+```
+
+# Meet the Contoso data
+
+```{r}
+db <- create_contoso_duckdb(size = "small")
+
+# view database! 
+# contoso::launch_ui(db$con)
+
+sales_df <- db$sales |> dplyr::collect()
+View(sales_df)
+```
+
+## Define a prediction task
+
+Rather than predicting raw profit, we'll create a binary outcome of high vs low margin orders.
+
+```{r}
+feature_data <- sales_df |>
+  mutate(
+    shipping_lag = as.numeric(delivery_date - order_date),
+    is_online = if_else(store_key == 999999, 1, 0),
+    
+    # Standardize to USD
+    gross_margin_usd = gross_margin / exchange_rate,
+    discount_pct = if_else(gross_revenue > 0, discounts / gross_revenue, 0),
+    
+    # Target: Top quartile margin
+    is_high_margin = factor(
+      if_else(gross_margin_usd > quantile(gross_margin_usd, 0.75, na.rm = TRUE), "High", "Low"),
+      levels = c("High", "Low")
+    )
+  ) |>
+  select(
+    is_high_margin,
+    quantity,
+    unit_price,
+    discount_pct,
+    shipping_lag,
+    is_online,
+    product_key,
+    store_key
+  ) |>
+  tidyr::drop_na() |>
+  dplyr::sample_frac(size = 0.01) # so folks can run this on their CPU quickly 
+```
+
+# What is TabPFN?
+
+TabPFN stands for **Tabular Prior-data Fitted Network**.
+
+It belongs to a newer family of models called **Tabular Foundation Models**. Instead of extensive hyperparameter tuning, TabPFN performs inference using a foundation model trained over millions of synthetic learning tasks. It supports classification and regression on many small-to-medium tabular datasets with minimal configuration.
+
+# Train a model
+
+```{r}
+set.seed(2026)
+
+model_data <- feature_data 
+
+# our typical data split
+data_split <- initial_split(model_data, prop = 0.8, strata = 'is_high_margin')
+train_df <- training(data_split)
+test_df  <- testing(data_split)
+
+# x, y fit method
+X_train <- select(train_df, -is_high_margin)
+y_train <- train_df$is_high_margin
+
+X_test <- select(test_df, -is_high_margin)
+y_test <- test_df$is_high_margin
+```
+
+```{r}
+# **this does not fit a model!**
+# it stages the data for the forward pass on test, 
+# it will also install the python dependencies the first time you call it & the pretrained checkpoint from huggingface. 
+# additional setup notes such as user license requirements are listed on the tabpfn library README.
+fit <- tab_pfn(X_train, y_train)
+```
+
+```{r}
+pred <- predict(fit, X_test)
+
+head(pred)
+```
+
+# Build a reusable one shot fit & predict function
+
+```{r}
+tabpfn_fit_and_predict_v1 <- \(train_df, test_df){
+
+# same as above but within this special function
+X_train <- select(train_df, -is_high_margin)
+y_train <- train_df$is_high_margin
+
+X_test <- select(test_df, -is_high_margin)
+y_test <- test_df$is_high_margin
+
+fit <- tab_pfn(X_train, y_train)
+
+preds <- predict(fit, X_test)
+
+    preds
+
+}
+
+tabpfn_fit_and_predict_v1(train_df, test_df)
+```
+
+# Introducing ellmer
+
+ellmer provides a unified interface for LLM providers and supports tool calling from R.
+
+```{r}
+library(ellmer)
+
+chat <- ellmer::chat("ollama/gemma4")
+
+chat$chat("Hello! Please introduce yourself in one sentence.")
+```
+
+# Register the prediction tool
+
+> **Note:** the chatbot provider & llm must be able to use 'tools' for this to work properly. 
+even then, you might run into some issues. like below. 
+```{r}
+# Example
+
+tabpfn_fit_and_predict_tool <- ellmer::tool(
+  tabpfn_fit_and_predict_v1,
+  name = "tabpfn_fit_and_predict_v1",
+  description = "Predict whether a sale will be highly profitable.", 
+  arguments = list(
+               # ellmer::type_dataframe :'(
+    train_df = ellmer::type_object("a dataframe such as 'training'"),
+    test_df = ellmer::type_object("a dataframe such as 'test'")
+  )
+)
+
+chat$register_tool(tabpfn_fit_and_predict_tool)
+
+# this won't work
+chat$chat("can you fit a tabpfn model for me? I have a train_df and test_df dataset, please help!")
+```
+
+# Register the tool, try again
+
+tools prefer type number, type string, pass a data.frame 'name' not a dataframe_df object.
+```{r}
+
+tabpfn_fit_and_predict <- \(train_df_name, test_df_name, target_var) {
+  # Resolve string names to active global environment objects
+  train_df <- get(train_df_name, envir = .GlobalEnv)
+  test_df  <- get(test_df_name, envir = .GlobalEnv)
+  
+  X_train <- select(train_df, -all_of(target_var))
+  y_train <- train_df[[target_var]]
+  
+  X_test  <- select(test_df, -all_of(target_var))
+  
+  fit <- tab_pfn(X_train, y_train)
+  predict(fit, X_test)
+}
+
+# Define the ellmer tool with string parameters
+tabpfn_tool <- ellmer::tool(
+  tabpfn_fit_and_predict,
+  name = "tabpfn_fit_and_predict",
+  description = "Fits a TabPFN model and predicts outcomes given in-memory R data frame object names.",
+  arguments = list(
+    train_df_name = ellmer::type_string("Name of the training data frame object in R memory (e.g. 'train_df')"),
+    test_df_name  = ellmer::type_string("Name of the testing data frame object in R memory (e.g. 'test_df')"),
+    target_var    = ellmer::type_string("Name of the target outcome column to predict (e.g. 'is_high_margin')")
+  )
+)
+
+#chat <- ellmer::chat("ollama/gemma4")
+chat$register_tool(tabpfn_tool)
+
+# Chat execution
+chat$chat("I have 'train_df' and 'test_df' objects loaded. Fit a tabpfn model to predict 'is_high_margin' and explain the prediction results to me.")
+```
+
+# register other tools and save structured data 
+
+```{r}
+library(ellmer)
+
+# TODO
+
+```
+
+# Discussion
+
+In this notebook:
+
+- TabPFN performs statistical prediction.
+- ellmer provides natural-language reasoning and tool orchestration.
+- Together they form an AI-assisted analytical workflow.
+
+# Take Home Exercises
+
+1. Change the prediction target.
+2. Compare another business outcome.
+3. Add another prediction tool or descriptive statistic tool.
+4. Ask the assistant additional business questions with more tools.

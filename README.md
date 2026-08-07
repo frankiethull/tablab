@@ -1,2 +1,1 @@
-# tablab
-tabular foundation model data science labs 
+modern AI workflows using large language & tabular foundation models
