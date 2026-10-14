@@ -1,0 +1,186 @@
+---
+title: "Building a modeling assistant in {ellmer} powered by a local LLM"
+author: "frank hull"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Welcome
+
+This lab introduces **Tabular Foundation Models** in R using **tabpfn** and shows how to expose predictive models as tools using **ellmer**.
+
+## Learning objectives
+
+- Train a TabPFN regressor 
+- Explore a "hot" dataset
+- Wrap model workflow into a reusable R function
+- Register those functions as LLM tools
+- Build a simple AI assistant
+- **bonus:** a dynamically created validation report *(no template)*
+
+```{r}
+# install.packages("pak")
+# dev version contains R-only tabpfn & tabicl foundation models 
+# pak::pak("tidymodels/brulee")
+
+library(ellmer)
+library(brulee)
+library(rsample)
+library(dplyr)
+library(yardstick)
+```
+
+
+# Meet The Data 🏎️💨
+
+```{r}
+data <- datasets::mtcars
+
+View(data)
+```
+
+
+# What is TabPFN?
+
+TabPFN stands for **Tabular Prior-data Fitted Network**.
+
+It belongs to a newer family of models called **Tabular Foundation Models**. Instead of extensive hyperparameter tuning, TabPFN performs inference using a foundation model trained over millions of synthetic learning tasks. It supports classification and regression on many small-to-medium tabular datasets with minimal configuration.
+
+TabICL, another tabular foundation model, is also available in brulee. 
+
+# Train a model
+
+```{r}
+set.seed(2026)
+
+model_data <- data 
+
+# our typical data split
+data_split <- initial_split(model_data, prop = 0.8)
+train_df <- training(data_split)
+test_df  <- testing(data_split)
+
+# x, y fit method
+X_train <- select(train_df, -mpg)
+y_train <- train_df$mpg
+
+X_test <- select(test_df, -mpg)
+y_test <- test_df$mpg
+```
+
+```{r}
+# initial fit will download the pre-trained checkpoint, 
+# fit doesn't actually "fit" a model, it is fast. 
+# a convenient placeholder to stage the training data
+# all time happens during the predict() stage
+
+# fit <- brulee_tab_icl(X_train, y_train)
+fit <- brulee_tab_pfn(X_train, y_train)
+```
+
+
+```{r}
+pred <- predict(fit, X_test)
+
+pred
+```
+
+
+# Introducing ellmer
+
+ellmer provides a unified interface for LLM providers and supports tool calling from R.
+
+```{r}
+chat <- ellmer::chat("ollama/gemma4")
+
+chat$chat("Hello! Please introduce yourself in one sentence.")
+```
+
+
+# Register the prediction tool
+
+> **Note:** the chatbot provider & llm must be able to use 'tools' for this to work properly. 
+
+tools need valid JSON types: type number, type string, i.e. pass a data.frame 'name' not a dataframe_df object.
+```{r}
+
+tabpfn_fit_and_predict <- \(train_df_name, test_df_name, target_var) {
+  # Resolve string names to active global environment objects
+  train_df <- get(train_df_name, envir = .GlobalEnv)
+  test_df  <- get(test_df_name, envir = .GlobalEnv)
+  
+  X_train <- select(train_df, -all_of(target_var))
+  y_train <- train_df[[target_var]]
+  
+  X_test  <- select(test_df, -all_of(target_var))
+  
+  #fit <- brulee_tab_icl(X_train, y_train)
+   fit <- brulee_tab_pfn(X_train, y_train)
+  predict(fit, X_test) |> dplyr::pull(.pred)
+}
+
+# Define the ellmer tool with string parameters
+tabpfn_tool <- ellmer::tool(
+  tabpfn_fit_and_predict,
+  name = "tabpfn_fit_and_predict",
+  description = "Fits a TabPFN model and predicts outcomes given in-memory R data frame object names.",
+  arguments = list(
+    train_df_name = ellmer::type_string("Name of the training data frame object in R memory (e.g. 'train_df')"),
+    test_df_name  = ellmer::type_string("Name of the testing data frame object in R memory (e.g. 'test_df')"),
+    target_var    = ellmer::type_string("Name of the target outcome column to predict (e.g. 'mpg')")
+  )
+)
+
+#chat <- ellmer::chat("ollama/gemma4")
+chat$register_tool(tabpfn_tool)
+
+# Chat execution
+chat$chat("I have 'train_df' and 'test_df' objects loaded. Fit a tabpfn model to predict 'mpg' and explain the prediction results to me.")
+```
+
+asking for the results so we can do some comparison on our end. *or register yardstick as a tool*
+```{r}
+estimated_vector <- chat$chat("
+can you output the predictions as a single vector, 
+like [1, 2, 3, 4]? 
+do not include any words or backticks"
+) |> jsonlite::fromJSON()
+
+yardstick::rmse_vec(y_test, estimated_vector)
+```
+
+# Register a dynamic reporting tool 
+
+```{r}
+validation_report_fcn <- \(content){
+ filename <- "validation_report"
+
+  qmd_path <- paste0(filename, ".qmd")
+  html_path <- paste0(filename, ".html")
+  
+  writeLines(content, qmd_path)
+  quarto::quarto_render(qmd_path, output_format = "html", quiet = TRUE)
+  browseURL(html_path)
+  
+  return(paste("Report rendered successfully and opened:", html_path))
+}
+
+
+validation_report_tool <- ellmer::tool(
+    validation_report_fcn,
+    name = "validation_report_tool",
+  description = "creates a validation report for the user when they ask for one. please use this if they ask for a comparison between predictions and truth",
+  arguments = list( content = ellmer::type_string("write a complete Quarto document content including YAML frontmatter, markdown text, and executable code chunks for tables or plots using R")
+  )
+)
+
+chat$register_tool(validation_report_tool)
+
+chat$chat(c("can you create a validation report? here is our ground truth: ", y_test))
+```
