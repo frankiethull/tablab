@@ -1,5 +1,7 @@
 # Recommender: Dynamic LLM Routing & Token Optimization Engine
 
+### please see `frankiethull/RouterPFN`
+
 This lab implements an intelligent model routing framework designed to minimize token costs by evaluating prompt complexity prior to execution.
 
 ## Key Concepts
