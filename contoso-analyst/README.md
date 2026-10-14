@@ -8,6 +8,6 @@ This lab demonstrates how to pair **TabPFN** with **`ellmer`** to create an auto
 
 ## Tech Stack
 - **R / Tidyverse**: Data manipulation and feature prep
-- **`tabpfn`**: Tabular Foundation Model engine
+- **`tabpfn`**: Tabular Foundation Model engine *using reticulate*
 - **`ellmer`**: Unified R interface for LLM interaction and tool registration
 - **`ollama/gemma4`**: Local LLM execution
